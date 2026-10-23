@@ -65,17 +65,29 @@ def clic_si_existe(page, patron):
     return False
 
 
+def clic_texto(page, patron, espera=3000):
+    el = page.get_by_text(re.compile(patron, re.I))
+    if el.count():
+        el.first.click(timeout=10000)
+        page.wait_for_timeout(espera)
+        return True
+    return False
+
+
 def diagnostico(page):
     try:
         info = {"url": page.url, "titulo": page.title()}
         info["campos"] = page.eval_on_selector_all(
-            "input, select, textarea",
-            "els => els.map(e => ({tipo: e.type, placeholder: e.placeholder, name: e.name, "
-            "id: e.id, visible: !!(e.offsetWidth || e.offsetHeight)}))")
+            "input:not([type=radio]), textarea, [role=combobox]",
+            "els => els.map(e => ({tipo: e.type || e.getAttribute('role'), placeholder: e.placeholder, "
+            "name: e.name, id: e.id, visible: !!(e.offsetWidth || e.offsetHeight)}))")
+        info["listas"] = page.eval_on_selector_all(
+            "select",
+            "els => els.map(e => ({name: e.name, id: e.id, opciones: [...e.options].map(o => o.text).slice(0, 25)}))")
         info["botones"] = page.eval_on_selector_all(
-            "button, a, [role=button], [role=tab], [role=option], li",
+            "button, a, [role=button], [role=option], label",
             "els => els.map(e => (e.innerText || '').trim()).filter(t => t && t.length < 60).slice(0, 60)")
-        info["texto"] = page.inner_text("body")[:1500]
+        info["texto"] = page.inner_text("body")[:2000]
         return json.dumps(info, ensure_ascii=False, indent=1)
     except Exception as e:
         return f"(sin diagnóstico: {e})"
@@ -88,53 +100,59 @@ def ir_al_menu(page):
         raise Bloqueado()
 
 
+def elegir_doctor(page):
+    # 1) Lista desplegable nativa que contenga al doctor
+    for sel in page.locator("select:visible").all():
+        textos = sel.eval_on_selector_all("option", "os => os.map(o => o.text)")
+        match = [t for t in textos if DOCTOR.lower() in t.lower()]
+        if match:
+            sel.select_option(label=match[0])
+            page.wait_for_timeout(4000)
+            return
+    # 2) Campo de texto / autocompletar
+    campo = page.locator(
+        "input[placeholder*='profesional' i]:visible, input[placeholder*='médico' i]:visible, "
+        "input[placeholder*='medico' i]:visible, input[placeholder*='nombre' i]:visible, "
+        "input[placeholder*='buscar' i]:visible, [role=combobox]:visible, "
+        "input[type='search']:visible, input[type='text']:visible"
+    )
+    if not campo.count():
+        raise RuntimeError("Marqué 'Por Profesional' pero no encontré dónde buscar al doctor")
+    campo.first.click(timeout=10000)
+    campo.first.type(DOCTOR, delay=120)
+    page.wait_for_timeout(5000)
+    opcion = page.get_by_role("option", name=re.compile(DOCTOR, re.I))
+    if not opcion.count():
+        opcion = page.locator("li, div[class*='option' i]").filter(has_text=re.compile(DOCTOR, re.I))
+    if not opcion.count():
+        raise RuntimeError("Escribí LAHSEN pero no apareció en la lista")
+    opcion.first.click(timeout=10000)
+    page.wait_for_timeout(4000)
+
+
 def revisar(page, modo, patron_boton, capturas):
     capturas.clear()
     try:
-        boton = page.get_by_text(re.compile(patron_boton, re.I))
-        if not boton.count():
-            page.go_back()
-            page.wait_for_timeout(5000)
-            boton = page.get_by_text(re.compile(patron_boton, re.I))
-        if not boton.count():
+        if not clic_texto(page, patron_boton, 6000):
             ir_al_menu(page)
-            boton = page.get_by_text(re.compile(patron_boton, re.I))
-        boton.first.click(timeout=10000)
-        page.wait_for_timeout(6000)
+            if not clic_texto(page, patron_boton, 6000):
+                raise RuntimeError(f"No encontré el botón {modo} en el menú")
         if bloqueado(page):
             raise Bloqueado()
 
-        if RUT:
-            rut = page.locator("input[placeholder*='rut' i]:visible, input[name*='rut' i]:visible")
-            if rut.count():
-                rut.first.fill(RUT)
-                page.keyboard.press("Enter")
-                page.wait_for_timeout(4000)
+        if modo == "Presencial":
+            clic_texto(page, r"CL[IÍ]NICA\s+LAS\s+CONDES\s+ESTORIL")
 
-        clic_si_existe(page, r"(por )?(m[eé]dico|profesional|doctor)")
+        if not clic_texto(page, r"^\s*Por\s+Profesional\s*$"):
+            page.get_by_label(re.compile(r"Por\s+Profesional", re.I)).first.check(timeout=10000)
+            page.wait_for_timeout(3000)
 
-        campo = page.locator(
-            "input[placeholder*='médico' i]:visible, input[placeholder*='medico' i]:visible, "
-            "input[placeholder*='profesional' i]:visible, input[placeholder*='nombre' i]:visible, "
-            "input[placeholder*='buscar' i]:visible, input[type='search']:visible"
-        )
-        if not campo.count():
-            campo = page.locator("input[type='text']:visible, input:not([type]):visible")
-        if not campo.count():
-            raise RuntimeError("No encontré un buscador visible después de elegir el tipo de consulta")
-
-        campo.first.click(timeout=10000)
-        campo.first.type(DOCTOR, delay=120)
-        page.wait_for_timeout(5000)
-        opcion = page.get_by_text(re.compile(DOCTOR, re.I))
-        if opcion.count():
-            opcion.first.click(timeout=10000)
-            page.wait_for_timeout(4000)
-        clic_si_existe(page, r"buscar|ver horas|continuar|siguiente")
+        elegir_doctor(page)
+        clic_si_existe(page, r"buscar|ver horas|continuar|siguiente|consultar")
         page.wait_for_timeout(8000)
 
         texto = page.inner_text("body")
-        page.screenshot(path=str(OUT / f"{modo}.png"))
+        page.screenshot(path=str(OUT / f"{modo}.png"), full_page=True)
         (OUT / f"{modo}.txt").write_text(texto, encoding="utf-8")
         (OUT / f"{modo}.json").write_text(json.dumps(capturas, ensure_ascii=False)[:5_000_000], encoding="utf-8")
 
@@ -150,7 +168,7 @@ def revisar(page, modo, patron_boton, capturas):
         raise
     except Exception as e:
         try:
-            page.screenshot(path=str(OUT / f"{modo}-error.png"))
+            page.screenshot(path=str(OUT / f"{modo}-error.png"), full_page=True)
         except Exception:
             pass
         raise RuntimeError(f"{str(e)[:300]}\n\nDIAGNÓSTICO {modo}:\n{diagnostico(page)}")
