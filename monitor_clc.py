@@ -10,7 +10,7 @@ from playwright.sync_api import sync_playwright
 DOCTOR = os.getenv("DOCTOR_APELLIDO", "LAHSEN")
 BASE = "https://reserva.clinicalascondes.cl/agendaweb/"
 MODOS = {"Presencial": r"Consulta\s+Presencial", "Telemedicina": r"Consulta\s+Telemedicina"}
-STATE = Path("state/estado_v3.json")
+STATE = Path("state/estado_v4.json")
 OUT = Path("out")
 STATE.parent.mkdir(exist_ok=True)
 OUT.mkdir(exist_ok=True)
@@ -157,9 +157,12 @@ def revisar(page, modo, patron_boton):
 
 
 def resumen(modo, r):
+    lugar = "Clínica Las Condes Estoril" if modo == "Presencial" else "Clínica Las Condes, por telemedicina"
     horas = " · ".join(r["horas"]) or "—"
-    return f"{modo}\nPróxima fecha: {r['fecha'] or 'sin horas publicadas'}\nHoras: {horas}"
-
+    return (f"Estas son las horas disponibles del Dr. Lahsen en {lugar}:\n"
+            f"Próxima fecha: {r['fecha'] or 'sin horas publicadas'}\n"
+            f"Horas: {horas}")
+      
 
 def enviar_correo(asunto, cuerpo, adjuntos=()):
     user, pwd = os.getenv("GMAIL_USER"), os.getenv("GMAIL_APP_PASSWORD")
