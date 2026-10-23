@@ -1,5 +1,6 @@
 
 import os, re, json, smtplib
+from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.image import MIMEImage
@@ -7,27 +8,28 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright
 
 DOCTOR = os.getenv("DOCTOR_APELLIDO", "LAHSEN")
-RUT = os.getenv("PACIENTE_RUT", "")
 BASE = "https://reserva.clinicalascondes.cl/agendaweb/"
 MODOS = {"Presencial": r"Consulta\s+Presencial", "Telemedicina": r"Consulta\s+Telemedicina"}
-STATE = Path("state/estado_v2.json")
+STATE = Path("state/estado_v3.json")
 OUT = Path("out")
 STATE.parent.mkdir(exist_ok=True)
 OUT.mkdir(exist_ok=True)
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36")
 
-HORA_RE = re.compile(r"\b([01]?\d|2[0-3]):[0-5]\d\b")
-FECHA_RE = re.compile(
-    r"\b(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}-\d{2}-\d{2})\b|"
-    r"\b(lunes|martes|mi[eé]rcoles|jueves|viernes|s[aá]bado|domingo)\b[^\n]{0,25}\d{1,2}",
-    re.I,
-)
-CLAVES_JSON = ("fecha", "hora", "inicio", "slot", "cupo", "disponib")
+FECHA_PROX_RE = re.compile(r"pr[oó]xima\s+fecha\s+disponible:?\s*(\d{1,2}-\d{1,2}-\d{4})", re.I)
+HORA_LINEA_RE = re.compile(r"^([01]?\d|2[0-3]):[0-5]\d$")
 
 
 class Bloqueado(Exception):
     pass
+
+
+def a_fecha(s):
+    try:
+        return datetime.strptime(s or "", "%d-%m-%Y").date()
+    except Exception:
+        return None
 
 
 def bloqueado(page):
@@ -36,20 +38,6 @@ def bloqueado(page):
     except Exception:
         return False
     return any(s in t for s in ("verificación de seguridad", "ser humano", "just a moment", "verify you are human"))
-
-
-def extraer_de_json(obj, acc):
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            if isinstance(v, (str, int)) and any(c in k.lower() for c in CLAVES_JSON):
-                s = str(v)
-                if HORA_RE.search(s) or FECHA_RE.search(s):
-                    acc.add(f"{k}={s}")
-            else:
-                extraer_de_json(v, acc)
-    elif isinstance(obj, list):
-        for x in obj:
-            extraer_de_json(x, acc)
 
 
 def clic_si_existe(page, patron):
@@ -80,10 +68,7 @@ def diagnostico(page):
         info["campos"] = page.eval_on_selector_all(
             "input:not([type=radio]), textarea, [role=combobox]",
             "els => els.map(e => ({tipo: e.type || e.getAttribute('role'), placeholder: e.placeholder, "
-            "name: e.name, id: e.id, visible: !!(e.offsetWidth || e.offsetHeight)}))")
-        info["listas"] = page.eval_on_selector_all(
-            "select",
-            "els => els.map(e => ({name: e.name, id: e.id, opciones: [...e.options].map(o => o.text).slice(0, 25)}))")
+            "visible: !!(e.offsetWidth || e.offsetHeight)}))")
         info["botones"] = page.eval_on_selector_all(
             "button, a, [role=button], [role=option], label",
             "els => els.map(e => (e.innerText || '').trim()).filter(t => t && t.length < 60).slice(0, 60)")
@@ -100,8 +85,18 @@ def ir_al_menu(page):
         raise Bloqueado()
 
 
+def marcar_por_profesional(page):
+    patron = re.compile(r"Por\s+Profesional", re.I)
+    op = page.locator("label, button, [role=radio]").filter(has_text=patron)
+    try:
+        op.first.wait_for(state="visible", timeout=15000)
+        op.first.click()
+    except Exception:
+        page.get_by_label(patron).first.check(force=True, timeout=10000)
+    page.wait_for_timeout(3000)
+
+
 def elegir_doctor(page):
-    # 1) Lista desplegable nativa que contenga al doctor
     for sel in page.locator("select:visible").all():
         textos = sel.eval_on_selector_all("option", "os => os.map(o => o.text)")
         match = [t for t in textos if DOCTOR.lower() in t.lower()]
@@ -109,7 +104,6 @@ def elegir_doctor(page):
             sel.select_option(label=match[0])
             page.wait_for_timeout(4000)
             return
-    # 2) Campo de texto / autocompletar
     campo = page.locator(
         "input[placeholder*='profesional' i]:visible, input[placeholder*='médico' i]:visible, "
         "input[placeholder*='medico' i]:visible, input[placeholder*='nombre' i]:visible, "
@@ -130,8 +124,7 @@ def elegir_doctor(page):
     page.wait_for_timeout(4000)
 
 
-def revisar(page, modo, patron_boton, capturas):
-    capturas.clear()
+def revisar(page, modo, patron_boton):
     try:
         if not clic_texto(page, patron_boton, 6000):
             ir_al_menu(page)
@@ -139,31 +132,20 @@ def revisar(page, modo, patron_boton, capturas):
                 raise RuntimeError(f"No encontré el botón {modo} en el menú")
         if bloqueado(page):
             raise Bloqueado()
-
         if modo == "Presencial":
             clic_texto(page, r"CL[IÍ]NICA\s+LAS\s+CONDES\s+ESTORIL")
-
-        if not clic_texto(page, r"^\s*Por\s+Profesional\s*$"):
-            page.get_by_label(re.compile(r"Por\s+Profesional", re.I)).first.check(timeout=10000)
-            page.wait_for_timeout(3000)
-
+        marcar_por_profesional(page)
         elegir_doctor(page)
         clic_si_existe(page, r"buscar|ver horas|continuar|siguiente|consultar")
         page.wait_for_timeout(8000)
+        clic_si_existe(page, r"m[aá]s\s+horas")
 
         texto = page.inner_text("body")
         page.screenshot(path=str(OUT / f"{modo}.png"), full_page=True)
-        (OUT / f"{modo}.txt").write_text(texto, encoding="utf-8")
-        (OUT / f"{modo}.json").write_text(json.dumps(capturas, ensure_ascii=False)[:5_000_000], encoding="utf-8")
-
-        horas = set()
-        for linea in texto.splitlines():
-            linea = linea.strip()
-            if linea and len(linea) < 120 and (HORA_RE.search(linea) or FECHA_RE.search(linea)):
-                horas.add(linea)
-        for c in capturas:
-            extraer_de_json(c["body"], horas)
-        return sorted(horas)
+        m = FECHA_PROX_RE.search(texto)
+        horas = {l.strip() for l in texto.splitlines() if HORA_LINEA_RE.match(l.strip())}
+        return {"fecha": m.group(1) if m else None,
+                "horas": sorted(horas, key=lambda h: [int(x) for x in h.split(":")])}
     except Bloqueado:
         raise
     except Exception as e:
@@ -172,6 +154,11 @@ def revisar(page, modo, patron_boton, capturas):
         except Exception:
             pass
         raise RuntimeError(f"{str(e)[:300]}\n\nDIAGNÓSTICO {modo}:\n{diagnostico(page)}")
+
+
+def resumen(modo, r):
+    horas = " · ".join(r["horas"]) or "—"
+    return f"{modo}\nPróxima fecha: {r['fecha'] or 'sin horas publicadas'}\nHoras: {horas}"
 
 
 def enviar_correo(asunto, cuerpo, adjuntos=()):
@@ -195,26 +182,16 @@ def enviar_correo(asunto, cuerpo, adjuntos=()):
 def main():
     previo = json.loads(STATE.read_text()) if STATE.exists() else {}
     estado, exitos, errores, bloqueo = dict(previo), {}, [], False
-    capturas = []
 
     with sync_playwright() as p:
         browser = p.chromium.launch()
         ctx = browser.new_context(locale="es-CL", user_agent=UA, viewport={"width": 1366, "height": 900})
         page = ctx.new_page()
-
-        def on_resp(r):
-            try:
-                if "json" in (r.headers.get("content-type") or ""):
-                    capturas.append({"url": r.url, "body": r.json()})
-            except Exception:
-                pass
-
-        page.on("response", on_resp)
         try:
             ir_al_menu(page)
             for modo, patron in MODOS.items():
                 try:
-                    exitos[modo] = revisar(page, modo, patron, capturas)
+                    exitos[modo] = revisar(page, modo, patron)
                     estado[modo] = exitos[modo]
                 except Bloqueado:
                     bloqueo = True
@@ -227,31 +204,37 @@ def main():
 
     estado["_bloqueos"] = previo.get("_bloqueos", 0) + 1 if bloqueo else 0
     STATE.write_text(json.dumps(estado, ensure_ascii=False, indent=1))
-    link = f"Agenda: {BASE}\nTeléfono: 22 610 8000 opción 1"
+    pie = f"\n\nReserva: {BASE}\nTeléfono: 22 610 8000 opción 1"
 
     if estado["_bloqueos"] == 3:
         enviar_correo("🛑 Monitor Dr. Lahsen: la CLC lo está bloqueando",
-                      f"La verificación de seguridad de la CLC frenó al monitor 3 veces seguidas. "
-                      f"Seguirá intentando, pero revisa también a mano.\n\n{link}")
-
+                      "La verificación de seguridad frenó al monitor 3 veces seguidas. "
+                      "Seguirá intentando, pero revisa también a mano." + pie)
     if errores:
         enviar_correo("⚠️ Monitor Dr. Lahsen: no pudo revisar",
-                      "\n\n".join(errores) + f"\n\n{link}",
-                      sorted(OUT.glob("*-error.png")))
+                      "\n\n".join(errores) + pie, sorted(OUT.glob("*-error.png")))
 
-    primera = {m: h for m, h in exitos.items() if m not in previo}
+    primera, alertas = [], []
+    for modo, r in exitos.items():
+        ant = previo.get(modo)
+        if ant is None:
+            primera.append(modo)
+            continue
+        f_ant, f_nueva = a_fecha(ant.get("fecha")), a_fecha(r["fecha"])
+        if f_nueva and (not f_ant or f_nueva < f_ant):
+            alertas.append(f"🔥 FECHA MÁS PRONTA (antes: {ant.get('fecha') or 'sin horas'})\n{resumen(modo, r)}")
+        elif f_nueva and f_nueva == f_ant and set(r["horas"]) - set(ant.get("horas", [])):
+            nuevas = sorted(set(r["horas"]) - set(ant.get("horas", [])))
+            alertas.append(f"Horas nuevas ese día: {' · '.join(nuevas)}\n{resumen(modo, r)}")
+
     if primera:
-        cuerpo = "\n".join(f"\n[{m}] {len(h)} hallazgos:\n" + "\n".join(h[:40]) for m, h in primera.items())
-        enviar_correo("✅ Monitor Dr. Lahsen funcionando", f"Esto detectó:\n{cuerpo}\n\n{link}",
+        enviar_correo("✅ Monitor Dr. Lahsen funcionando",
+                      "\n\n".join(resumen(m, exitos[m]) for m in primera) + pie,
                       [OUT / f"{m}.png" for m in primera])
-
-    nuevas = {m: [h for h in hs if h not in set(previo.get(m, []))]
-              for m, hs in exitos.items() if m in previo}
-    nuevas = {m: hs for m, hs in nuevas.items() if hs}
-    if nuevas:
-        cuerpo = "\n".join(f"\n[{m}]\n" + "\n".join(hs[:30]) for m, hs in nuevas.items())
-        enviar_correo("🚨 Nueva hora Dr. Lahsen - CLC", f"Horas nuevas:\n{cuerpo}\n\nReserva YA:\n{link}")
-    print("Bloqueo:", bloqueo, "| Errores:", len(errores), "| Nuevas:", nuevas or "ninguna")
+    if alertas:
+        mejor = min((exitos[m]["fecha"] for m in exitos if exitos[m]["fecha"]), key=a_fecha, default="")
+        enviar_correo(f"🚨 Hora Dr. Lahsen disponible: {mejor}", "\n\n".join(alertas) + pie)
+    print("Bloqueo:", bloqueo, "| Errores:", len(errores), "| Alertas:", len(alertas))
 
 
 if __name__ == "__main__":
