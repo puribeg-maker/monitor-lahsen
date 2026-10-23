@@ -1,1 +1,46 @@
+name: Monitor horas Dr. Lahsen
 
+on:
+  schedule:
+    - cron: "0 */2 * * *"
+  workflow_dispatch:
+
+jobs:
+  revisar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Instalar Playwright
+        run: |
+          pip install playwright==1.47.0
+          python -m playwright install --with-deps chromium
+      - name: Recuperar estado anterior
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: estado-${{ github.run_id }}
+          restore-keys: estado-
+      - name: Revisar agenda CLC
+        env:
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          ALERT_TO: ${{ secrets.ALERT_TO }}
+          PACIENTE_RUT: ${{ secrets.PACIENTE_RUT }}
+        run: python monitor_clc.py
+      - name: Guardar estado
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: estado-${{ github.run_id }}
+      - name: Guardar capturas
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: capturas
+          path: out
+          retention-days: 3
